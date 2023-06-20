@@ -16,3 +16,6 @@ server.on('connection', (conn) => {
 server.on('error', console.error)
 
 server.listen(27312)
+process.on('SIGINT', () => {
+    adhoc.destroy()
+})

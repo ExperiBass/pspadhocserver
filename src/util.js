@@ -84,6 +84,7 @@ class AdhocClient {
         const packetBuffer = new BufferReader(packet)
         const opcode = packetBuffer.readNext('uint8')
         let result;
+        console.log(opcode)
         switch (opcode) {
             case COMMON.CLIENT_OPCODES.PING: {
                 this.lastPing = Date.now()
@@ -183,9 +184,9 @@ class AdhocClient {
         groupName = groupName.replace(COMMON.SANITIZER, '')
 
         // now send the BSSID code and echo their info
-        const returnBSSIDPacket = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT_BSSID.toString().padStart(2, 0)}${client.macBytes.join('')}`, 'hex')
-        client.socket.write(returnBSSIDPacket)
-        //client.socket.write(returnConnectPacket)
+        const returnBSSIDPacket = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT_BSSID.toString().padStart(2, 0)}${this.macBytes.join('')}`, 'hex')
+        this.socket.write(returnBSSIDPacket)
+        //this.socket.write(returnConnectPacket)
         return groupName || '__unnamed'
     }
 }
@@ -258,9 +259,17 @@ class AdhocServer {
         const newClient = new AdhocClient(conn)
 
         // wait for the client to login and connect to a group
+        let loginWait = 0
         while (!newClient.isLoggedIn || !newClient.isConnected) {
+            if (loginWait > 100) {
+                // timeout
+                newClient.destroy()
+                console.log(`${newClient.ip} timed out logging in.`)
+                break
+            }
             // wait for the peer to go through the login first
             console.log(`Waiting for ${newClient.ip} to login...`)
+            loginWait++
             await sleep(10)
         }
 
@@ -274,6 +283,12 @@ class AdhocServer {
         // add client to list
         this.connectedClients.push(newClient)
         this.addPeerToGroup(newClient)
+    }
+    async destroy() {
+        for (const client of this.connectedClients) {
+            await client.destroy()
+        }
+        process.exit()
     }
 }
 
