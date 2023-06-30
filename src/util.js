@@ -46,6 +46,7 @@ class BufferReader {
 // TODO: Have AdhocClient manage timeouts
 //   maybe set the socket timeout instead?
 // TODO: Ratelimiting/banning
+// TODO: better logging (console.log is blocking)
 class AdhocClient {
     constructor(socket) {
         this.socket = socket
@@ -61,7 +62,6 @@ class AdhocClient {
         }
 
         console.log(`New connection from ${this.ip}`)
-        this.socket.setKeepAlive(true)
         this.socket.setTimeout(COMMON.SOCKET_TIMEOUT)
         // MAYBE: .setNoDelay? we do want to proxy...
         this.socket.on('data', (data) => {
@@ -70,6 +70,7 @@ class AdhocClient {
         this.socket.on('timeout', () => {
             this.destroy('socket timeout')
         })
+        // AdhocServer has a listener for closure
     }
     onData(data) {
         try {
@@ -176,6 +177,7 @@ class AdhocClient {
         // - 1 byte because readNext adds one (uint8 size)
         const padding = COMMON.LIMITS.CLIENT_NICKNAME_LENGTH - loginResults.nickname.length - 1
         productCodeLoop:
+        // TODO: validate each byte
         for (let i = 0; i < COMMON.LIMITS.CLIENT_PRODUCT_CODE_LENGTH; i++) {
             // add the padding on the first run
             const newByte = i === 0 ? packet.readNext('uint8', padding) : packet.readNext('uint8')
@@ -225,53 +227,53 @@ class AdhocServer {
         }
         return Object.keys(this.games[productcode])
     }
-    async addPeerToGroup(peer) {
-        console.log(`${peer.ip} connected as "${peer.nickname}".`)
+    async addClientToGroup(client) {
 
         // create the group and add the peer
-        if (!this.games[peer.productcode]) {
-            this.games[peer.productcode] = {}
+        if (!this.games[client.productcode]) {
+            this.games[client.productcode] = {}
         }
-        if (!this.games[peer.productcode][peer.group]) {
-            this.games[peer.productcode][peer.group] = {}
+        if (!this.games[client.productcode][client.group]) {
+            this.games[client.productcode][client.group] = {}
             // since a new group was created, mark this client as the creator
-            this.games[peer.productcode][peer.group].macBytes = peer.macBytes
-            this.games[peer.productcode][peer.group].peers = []
+            this.games[client.productcode][client.group].macBytes = client.macBytes
+            this.games[client.productcode][client.group].peers = []
         }
-        this.games[peer.productcode][peer.group].peers.push(peer)
+        this.games[client.productcode][client.group].peers.push(client)
 
         // broadcast client to group
-        const clientAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT.toString().padStart(2, 0)}${stringToHex(peer.nickname)}${peer.macBytes.join('')}${ipToInt(peer.ip).toString(16)}`, 'hex')
-        for (const currPeer of this.games[peer.productcode][peer.group].peers) {
-            if (currPeer === peer) {
+        // TODO: refactor into objects or somethin better
+        const clientAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT.toString().padStart(2, 0)}${stringToHex(client.nickname)}${client.macBytes.join('')}${ipToInt(client.ip).toString(16)}`, 'hex')
+        for (const currPeer of this.games[client.productcode][client.group].peers) {
+            if (currPeer === client) {
                 continue
             }
             const peerAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT.toString().padStart(2, 0)}${stringToHex(currPeer.nickname)}${currPeer.macBytes.join('')}${ipToInt(currPeer.ip).toString(16)}`, 'hex')
 
-            await peer.socket.write(peerAnnouncement)
+            await client.socket.write(peerAnnouncement)
             await currPeer.socket.write(clientAnnouncement)
         }
         return true
     }
-    async removePeerFromGroup(peer) {
-        if (!this.games[peer.productcode] || !this.games[peer.productcode][peer.group]) {
+    async removeClientFromGroup(client) {
+        if (!this.games[client.productcode] || !this.games[client.productcode][client.group]) {
             return true
         }
-        const clientAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.DISCONNECT.toString().padStart(2, 0)}${stringToHex(peer.nickname)}${peer.macBytes.join('')}${ipToInt(peer.ip).toString(16)}`, 'hex')
-        for (const currPeer of this.games[peer.productcode][peer.group].peers) {
-            if (currPeer === peer) {
+        const clientAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.DISCONNECT.toString().padStart(2, 0)}${stringToHex(client.nickname)}${client.macBytes.join('')}${ipToInt(client.ip).toString(16)}`, 'hex')
+        for (const currPeer of this.games[client.productcode][client.group].peers) {
+            if (currPeer === client) {
                 continue
             }
             const peerAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.DISCONNECT.toString().padStart(2, 0)}${stringToHex(currPeer.nickname)}${currPeer.macBytes.join('')}${ipToInt(currPeer.ip).toString(16)}`, 'hex')
 
-            await peer.socket.write(peerAnnouncement)
+            await client.socket.write(peerAnnouncement)
             await currPeer.socket.write(clientAnnouncement)
         }
 
-        const index = this.games[peer.productcode][peer.group].peers.findIndex((v) => v === peer)
-        this.games[peer.productcode][peer.group].peers.splice(index, 1)
-        if (this.games[peer.productcode][peer.group].peers.length === 0) {
-            delete this.games[peer.productcode][peer.group]
+        const index = this.games[client.productcode][client.group].peers.findIndex((v) => v === client)
+        this.games[client.productcode][client.group].peers.splice(index, 1)
+        if (this.games[client.productcode][client.group].peers.length === 0) {
+            delete this.games[client.productcode][client.group]
         }
         return true
     }
@@ -293,21 +295,22 @@ class AdhocServer {
         }
 
         // handle closing out here
+        // MAYBE: refactor into AdhocClient? how would group management work?
         newClient.socket.on('close', (hadError) => {
-            this.removePeerFromGroup(newClient)
+            this.removeClientFromGroup(newClient)
             const index = this.connectedClients.findIndex(v => v === newClient)
             this.connectedClients.splice(index, 1)
             console.log(`Closed connection to ${newClient.nickname}@${newClient.ip} (${newClient.macaddr})`)
         })
         // add client to list
         this.connectedClients.push(newClient)
-        this.addPeerToGroup(newClient)
+        this.addClientToGroup(newClient)
     }
     async destroy() {
         for (const client of this.connectedClients) {
-            await client.destroy()
+            await client.destroy('server shutdown')
         }
-        process.exit()
+        return true
     }
 }
 
@@ -323,7 +326,6 @@ function ipToInt(ip) {
 async function sleep(millis) {
     return new Promise(resolve => setTimeout(resolve, millis))
 }
-
 function stringToHex(str) {
     return str.split("")
         .map(c => c.charCodeAt(0).toString(16).padStart(2, "0"))
