@@ -6,10 +6,12 @@ const server = net.createServer({
     keepAlive: true
 })
 
+
 server.on('listening', () => {
     console.log('listening')
 })
 
+// relay connections to adhoc class
 server.on('connection', (conn) => {
     adhoc.handleConnection(conn)
 })

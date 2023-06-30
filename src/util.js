@@ -15,6 +15,7 @@ const COMMON = {
         CLIENT_PRODUCT_CODE_LENGTH: 9,
         CLIENT_GROUPNAME_LENGTH: 8
     },
+    SOCKET_TIMEOUT: 3000, // ms
     SANITIZER: /[\x00-\x1F\x7F]+/gu
 }
 class BufferReader {
@@ -42,6 +43,9 @@ class BufferReader {
         return (this.offset < this.buffer.length)
     }
 }
+// TODO: Have AdhocClient manage timeouts
+//   maybe set the socket timeout instead?
+// TODO: Ratelimiting/banning
 class AdhocClient {
     constructor(socket) {
         this.socket = socket
@@ -52,13 +56,19 @@ class AdhocClient {
 
         if (!this.ip) {
             // ip isnt valid
-            this.destroy()
+            this.destroy('invalid ip')
             return
         }
 
         console.log(`New connection from ${this.ip}`)
+        this.socket.setKeepAlive(true)
+        this.socket.setTimeout(COMMON.SOCKET_TIMEOUT)
+        // MAYBE: .setNoDelay? we do want to proxy...
         this.socket.on('data', (data) => {
             this.onData(data)
+        })
+        this.socket.on('timeout', () => {
+            this.destroy('socket timeout')
         })
     }
     onData(data) {
@@ -67,7 +77,6 @@ class AdhocClient {
         } catch (e) {
             switch (e.message) {
                 case 'Invalid Opcode': {
-                    this.socket.destroy()
                     return
                 }
                 default: {
@@ -76,15 +85,16 @@ class AdhocClient {
             }
         }
     }
-    destroy() {
+    destroy(reason) {
+        this.socket.destroy()
         this.isDestroyed = true
-        return this.socket.destroy()
+        console.log(`Connection from ${this.ip} closed: "${reason}"`)
+        return
     }
     parsePacket(packet) {
         const packetBuffer = new BufferReader(packet)
         const opcode = packetBuffer.readNext('uint8')
         let result;
-        console.log(opcode)
         switch (opcode) {
             case COMMON.CLIENT_OPCODES.PING: {
                 this.lastPing = Date.now()
@@ -106,6 +116,10 @@ class AdhocClient {
                 break;
             }
             case COMMON.CLIENT_OPCODES.CONNECT: {
+                if (!this.isLoggedIn) {
+                    // login first
+                    break
+                }
                 result = this.parseConnect(packetBuffer)
                 this.group = `${result}`
                 this.isConnected = true
@@ -113,13 +127,17 @@ class AdhocClient {
                 break;
             }
             case COMMON.CLIENT_OPCODES.DISCONNECT: {
+                if (!this.isConnected) {
+                    // youre already disconnected
+                    break
+                }
                 console.log(`"${this.nickname}" (${this.macaddr}) has disconnected from ${this.productcode} group "${this.group}".`)
                 this.isConnected = false
                 break;
             }
             default: {
-                console.error(`Invalid Opcode ${opcode} from ${this.ip}`)
-                throw Error('Invalid Opcode')
+                console.error(`Invalid Opcode ${opcode} from ${this.ip} (${this.macaddr})`)
+                result = packet.toString('hex')
             }
         }
         return { opcode, result }
@@ -132,15 +150,16 @@ class AdhocClient {
             productcode: ""
         }
         // read the 6 mac address bytes
+        // FIXME: pls better mac addr parsin
         for (let i = 0; i < 6; i++) {
             loginResults.macBytes.push(packet.readNext('uint8').toString(16).toUpperCase())
         }
         if (loginResults.macBytes.length !== 6) {
-            this.destroy()
+            this.destroy('invalid mac addr')
             return
         }
         loginResults.mac = loginResults.macBytes.join(':')
-        // join the mac address bytes
+
         // now get the client nickname
         nickLoop:
         for (let i = 0; i < COMMON.LIMITS.CLIENT_NICKNAME_LENGTH; i++) {
@@ -190,6 +209,8 @@ class AdhocClient {
         return groupName || '__unnamed'
     }
 }
+// TODO: extract common data (connected clients, etc)
+//   for clustering/sharding
 class AdhocServer {
     constructor() {
         this.games = {}
@@ -255,16 +276,14 @@ class AdhocServer {
         return true
     }
     async handleConnection(conn) {
-        // handle login
+        // socket is managed by AdhocClient
         const newClient = new AdhocClient(conn)
 
         // wait for the client to login and connect to a group
         let loginWait = 0
-        while (!newClient.isLoggedIn || !newClient.isConnected) {
-            if (loginWait > 100) {
-                // timeout
-                newClient.destroy()
-                console.log(`${newClient.ip} timed out logging in.`)
+        while (!newClient.isLoggedIn) {
+            if (loginWait > 100) { // 100 * 10ms
+                newClient.destroy('login timeout')
                 break
             }
             // wait for the peer to go through the login first
