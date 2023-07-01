@@ -8,7 +8,7 @@ const COMMON = {
         SCAN: 4,
         SCAN_COMPLETE: 5,
         CONNECT_BSSID: 6,
-        CHAT: 7
+        CHAT: 7 // MAYBE: implement chat? or tell client chat is unsupported?
     },
     LIMITS: {
         CLIENT_NICKNAME_LENGTH: 128,
@@ -18,6 +18,7 @@ const COMMON = {
     SOCKET_TIMEOUT: 3000, // ms
     SANITIZER: /[\x00-\x1F\x7F]+/gu
 }
+// MAYBE: move to ts?
 class BufferReader {
     constructor(buf) {
         this.buffer = Buffer.from(buf) // copy
@@ -48,8 +49,10 @@ class BufferReader {
 // TODO: Ratelimiting/banning
 // TODO: better logging (console.log is blocking)
 class AdhocClient {
-    constructor(socket) {
+    #server = null
+    constructor(socket, server) {
         this.socket = socket
+        this.#server = server
         this.ip = parseIP(socket.remoteAddress)
         this.isLoggedIn = false
         this.isDestroyed = false
@@ -112,19 +115,17 @@ class AdhocClient {
                 this.macBytes = result.macBytes
                 this.nickname = result.nickname
                 this.productcode = result.productcode
-                console.log(`"${this.nickname}" (${this.macaddr}) started playing ${this.productcode}.`)
                 this.isLoggedIn = true
                 break;
             }
             case COMMON.CLIENT_OPCODES.CONNECT: {
-                if (!this.isLoggedIn) {
+                if (!this.isLoggedIn || this.isConnected) {
                     // login first
                     break
                 }
                 result = this.parseConnect(packetBuffer)
                 this.group = `${result}`
-                this.isConnected = true
-                console.log(`"${this.nickname}" (${this.macaddr}) has connected to ${this.productcode} group "${this.group}".`)
+                this.isConnected = this.#server.addClientToGroup(this)
                 break;
             }
             case COMMON.CLIENT_OPCODES.DISCONNECT: {
@@ -132,8 +133,7 @@ class AdhocClient {
                     // youre already disconnected
                     break
                 }
-                console.log(`"${this.nickname}" (${this.macaddr}) has disconnected from ${this.productcode} group "${this.group}".`)
-                this.isConnected = false
+                this.isConnected = this.#server.removeClientFromGroup(this)
                 break;
             }
             default: {
@@ -170,6 +170,8 @@ class AdhocClient {
                 // if theres a null byte, thats the end of the string
                 break nickLoop;
             }
+            if (newByte < 0x14 || newByte > 0x7A) {// " " - z
+            }
             loginResults.nickname += String.fromCharCode(newByte)
         }
         loginResults.nickname = loginResults.nickname.replace(COMMON.SANITIZER, '')
@@ -183,7 +185,12 @@ class AdhocClient {
             const newByte = i === 0 ? packet.readNext('uint8', padding) : packet.readNext('uint8')
             if (newByte === 0x00) {
                 // if theres a null byte, thats the end of the string
-                break productCodeLoop;
+                break productCodeLoop
+            }
+            if (newByte < 0x20 || newByte > 0x7A) {
+                // invalid character
+                this.destroy('invalid product code byte')
+                break productCodeLoop
             }
             loginResults.productcode += String.fromCharCode(newByte)
         }
@@ -196,13 +203,15 @@ class AdhocClient {
         for (let i = 0; i < COMMON.LIMITS.CLIENT_GROUPNAME_LENGTH; i++) {
             const newByte = packet.readNext('uint8')
             if (newByte === 0x00) {
-                // if theres a null byte, thats the end of the string
-                break groupNameLoop;
+                break groupNameLoop
+            }
+            if (newByte < 0x20 || newByte > 0x7A) {
+                // invalid character
+                this.destroy('invalid group name byte')
+                break groupNameLoop
             }
             groupName += String.fromCharCode(newByte)
         }
-        // sanitize groupname
-        groupName = groupName.replace(COMMON.SANITIZER, '')
 
         // now send the BSSID code and echo their info
         const returnBSSIDPacket = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT_BSSID.toString().padStart(2, 0)}${this.macBytes.join('')}`, 'hex')
@@ -228,6 +237,9 @@ class AdhocServer {
         return Object.keys(this.games[productcode])
     }
     async addClientToGroup(client) {
+        if (client.isDestroyed || !client.isLoggedIn || client.isConnected) {
+            return false
+        }
 
         // create the group and add the peer
         if (!this.games[client.productcode]) {
@@ -253,9 +265,13 @@ class AdhocServer {
             await client.socket.write(peerAnnouncement)
             await currPeer.socket.write(clientAnnouncement)
         }
+        console.log(`"${client.nickname}" (${client.macaddr}) has connected to ${client.productcode} group "${client.group}".`)
         return true
     }
     async removeClientFromGroup(client) {
+        if (client.isDestroyed || !client.isLoggedIn || !client.isConnected) {
+            return false
+        }
         if (!this.games[client.productcode] || !this.games[client.productcode][client.group]) {
             return true
         }
@@ -275,6 +291,7 @@ class AdhocServer {
         if (this.games[client.productcode][client.group].peers.length === 0) {
             delete this.games[client.productcode][client.group]
         }
+        console.log(`"${client.nickname}" (${client.macaddr}) has disconnected from ${client.productcode} group "${client.group}".`)
         return true
     }
     async handleConnection(conn) {
@@ -293,10 +310,14 @@ class AdhocServer {
             loginWait++
             await sleep(10)
         }
+        if (!newClient.isLoggedIn || newClient.isDestroyed) {
+            return
+        }
 
         // handle closing out here
         // MAYBE: refactor into AdhocClient? how would group management work?
         newClient.socket.on('close', (hadError) => {
+            // MAYBE: unref socket?
             this.removeClientFromGroup(newClient)
             const index = this.connectedClients.findIndex(v => v === newClient)
             this.connectedClients.splice(index, 1)
@@ -304,7 +325,7 @@ class AdhocServer {
         })
         // add client to list
         this.connectedClients.push(newClient)
-        this.addClientToGroup(newClient)
+        console.log(`"${newClient.nickname}" (${newClient.macaddr}) started playing ${newClient.productcode}.`)
     }
     async destroy() {
         for (const client of this.connectedClients) {
