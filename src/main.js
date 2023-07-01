@@ -1,7 +1,7 @@
 const { COMMON, sleep, parseIP, ipToInt, stringToHex, BufferReader } = require('./util')
-const net = require('node:net')
 // TODO: Ratelimiting/banning
 // TODO: better logging (console.log is blocking)
+// TODO: make more robust (lots of parts just dont validate, such as client destroying)
 class AdhocClient {
     #server = null
     isLoggedIn = false
@@ -39,9 +39,7 @@ class AdhocClient {
             this.destroy('socket timeout')
         })
         this.socket.on('close', (hadError) => {
-            // MAYBE: unref socket?
-            this.#server.re
-            console.log(`Closed connection to ${newClient.nickname}@${newClient.ip} (${newClient.macaddr})`)
+            console.log(`Closed connection to ${this.nickname}@${this.ip} (${this.macaddr}): "${reason}"`)
         })
         // AdhocServer has a listener for closure
         this.waitForLogin()
@@ -59,8 +57,6 @@ class AdhocClient {
             loginWait++
             await sleep(10)
         }
-        // we can assume its logged in if we get here
-        this.#server.addClient(this)
     }
     async destroy(reason) {
         if (this.isConnectedToGroup) {
@@ -68,10 +64,9 @@ class AdhocClient {
             // and we want isConnected to be false
             this.isConnectedToGroup = !(await this.#server.removeClientFromGroup(this))
         }
+        this.isLoggedIn = !(this.#server.removeClient(this))
         this.socket.destroy()
-        this.isDestroyed = true
-        this.isLoggedIn = false
-        console.log(`Connection from ${this.ip} closed: "${reason}"`)
+        this.isDestroyed = this.socket.destroyed
         return
     }
     #parsePacket(packet) {
@@ -112,7 +107,7 @@ class AdhocClient {
                     // youre already disconnected
                     break
                 }
-                this.isConnectedToGroup = this.#server.removeClientFromGroup(this)
+                this.isConnectedToGroup = !(this.#server.removeClientFromGroup(this))
                 break;
             }
             default: {
@@ -187,7 +182,7 @@ class AdhocClient {
             if (newByte < 0x20 || newByte > 0x7A) {
                 // invalid character
                 this.destroy('invalid group name byte')
-                break groupNameLoop
+                return
             }
             groupName += String.fromCharCode(newByte)
         }
@@ -195,7 +190,7 @@ class AdhocClient {
         // now send the BSSID code and echo their info
         const returnBSSIDPacket = Buffer.from(`${COMMON.CLIENT_OPCODES.CONNECT_BSSID.toString().padStart(2, 0)}${this.macBytes.join('')}`, 'hex')
         this.socket.write(returnBSSIDPacket)
-        //this.socket.write(returnConnectPacket)
+
         return groupName || '__unnamed'
     }
 }
