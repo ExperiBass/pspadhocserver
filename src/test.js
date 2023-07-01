@@ -1,7 +1,7 @@
 const net = require('node:net')
 const AdhocServer = require('./main')
 
-const server = net.createServer(options)
+const server = net.createServer()
 const adhoc = new AdhocServer()
 
 server.on('listening', () => {

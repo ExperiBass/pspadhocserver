@@ -39,7 +39,7 @@ class AdhocClient {
             this.destroy('socket timeout')
         })
         this.socket.on('close', (hadError) => {
-            console.log(`Closed connection to ${this.nickname}@${this.ip} (${this.macaddr}): "${reason}"`)
+            
         })
         // AdhocServer has a listener for closure
         this.waitForLogin()
@@ -67,6 +67,7 @@ class AdhocClient {
         this.isLoggedIn = !(this.#server.removeClient(this))
         this.socket.destroy()
         this.isDestroyed = this.socket.destroyed
+        console.log(`Closed connection to ${this.nickname}@${this.ip} (${this.macaddr}): "${reason}"`)
         return
     }
     #parsePacket(packet) {
