@@ -49,7 +49,7 @@ function parseIP(ip) {
     // check for ipv4 and strip the v6 header if it exists
     const template = /^:(ffff)?:(?!0)(?!.*\.$)((1?\d?\d|25[0-5]|2[0-4]\d)(\.|$)){4}$/
     template.test(ip) ? "" : ip = ip.replace(/^.*:/, '')
-    return ip
+    return ip || false
 }
 function ipToInt(ip) {
     return ip.split('.').reduce((int, value) => int * 256 + +value)

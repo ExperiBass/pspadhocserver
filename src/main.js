@@ -1,57 +1,80 @@
-const {COMMON, sleep, parseIP, ipToInt, stringToHex, BufferReader } = require('./util')
+const { COMMON, sleep, parseIP, ipToInt, stringToHex, BufferReader } = require('./util')
 const net = require('node:net')
-// TODO: Have AdhocClient manage timeouts
-//   maybe set the socket timeout instead?
 // TODO: Ratelimiting/banning
 // TODO: better logging (console.log is blocking)
 class AdhocClient {
     #server = null
-    constructor(socket, server) {
+    isLoggedIn = false
+    isConnectedToGroup = false
+    isDestroyed = false
+    lastPing = 0
+    constructor(socket, server, id) {
         this.socket = socket
         this.#server = server
         this.ip = parseIP(socket.remoteAddress)
-        this.isLoggedIn = false
-        this.isDestroyed = false
-        this.isConnected = false
+        this.id = id // for finding later
 
         if (!this.ip) {
-            // ip isnt valid
             this.destroy('invalid ip')
             return
         }
-
         console.log(`New connection from ${this.ip}`)
         this.socket.setTimeout(COMMON.SOCKET_TIMEOUT)
-        // MAYBE: .setNoDelay? we do want to proxy...
+
         this.socket.on('data', (data) => {
-            this.onData(data)
+            try {
+                const { opcode, result } = this.#parsePacket(data)
+            } catch (e) {
+                switch (e.message) {
+                    case 'Invalid Opcode': {
+                        return
+                    }
+                    default: {
+                        console.error(e)
+                    }
+                }
+            }
         })
         this.socket.on('timeout', () => {
             this.destroy('socket timeout')
         })
+        this.socket.on('close', (hadError) => {
+            // MAYBE: unref socket?
+            this.#server.re
+            console.log(`Closed connection to ${newClient.nickname}@${newClient.ip} (${newClient.macaddr})`)
+        })
         // AdhocServer has a listener for closure
+        this.waitForLogin()
     }
-    onData(data) {
-        try {
-            const { opcode, result } = this.parsePacket(data)
-        } catch (e) {
-            switch (e.message) {
-                case 'Invalid Opcode': {
-                    return
-                }
-                default: {
-                    console.error(e)
-                }
+    async waitForLogin() {
+        // wait for the client to login
+        let loginWait = 0
+        while (!this.isLoggedIn) {
+            if (loginWait > 100) { // 100 * 10ms
+                this.destroy('login timeout')
+                return false
             }
+            // wait for the peer to go through the login first
+            console.log(`Waiting for ${this.ip} to login...`)
+            loginWait++
+            await sleep(10)
         }
+        // we can assume its logged in if we get here
+        this.#server.addClient(this)
     }
-    destroy(reason) {
+    async destroy(reason) {
+        if (this.isConnectedToGroup) {
+            // invert the output because server methods return true on success,
+            // and we want isConnected to be false
+            this.isConnectedToGroup = !(await this.#server.removeClientFromGroup(this))
+        }
         this.socket.destroy()
         this.isDestroyed = true
+        this.isLoggedIn = false
         console.log(`Connection from ${this.ip} closed: "${reason}"`)
         return
     }
-    parsePacket(packet) {
+    #parsePacket(packet) {
         const packetBuffer = new BufferReader(packet)
         const opcode = packetBuffer.readNext('uint8')
         let result;
@@ -65,31 +88,31 @@ class AdhocClient {
                     // already logged in, what are you doing?
                     break;
                 }
-                result = this.parseLogin(packetBuffer)
+                result = this.#parseLogin(packetBuffer)
                 // save client info
                 this.macaddr = result.mac
                 this.macBytes = result.macBytes
                 this.nickname = result.nickname
                 this.productcode = result.productcode
-                this.isLoggedIn = true
+                this.isLoggedIn = this.#server.addClient(this)
                 break;
             }
             case COMMON.CLIENT_OPCODES.CONNECT: {
-                if (!this.isLoggedIn || this.isConnected) {
+                if (!this.isLoggedIn || this.isConnectedToGroup) {
                     // login first
                     break
                 }
-                result = this.parseConnect(packetBuffer)
+                result = this.#parseConnect(packetBuffer)
                 this.group = `${result}`
-                this.isConnected = this.#server.addClientToGroup(this)
+                this.isConnectedToGroup = this.#server.addClientToGroup(this)
                 break;
             }
             case COMMON.CLIENT_OPCODES.DISCONNECT: {
-                if (!this.isConnected) {
+                if (!this.isConnectedToGroup) {
                     // youre already disconnected
                     break
                 }
-                this.isConnected = this.#server.removeClientFromGroup(this)
+                this.isConnectedToGroup = this.#server.removeClientFromGroup(this)
                 break;
             }
             default: {
@@ -99,7 +122,7 @@ class AdhocClient {
         }
         return { opcode, result }
     }
-    parseLogin(packet) {
+    #parseLogin(packet) {
         let loginResults = {
             nickname: "",
             mac: "",
@@ -153,7 +176,7 @@ class AdhocClient {
 
         return loginResults
     }
-    parseConnect(packet) {
+    #parseConnect(packet) {
         let groupName = ""
         groupNameLoop:
         for (let i = 0; i < COMMON.LIMITS.CLIENT_GROUPNAME_LENGTH; i++) {
@@ -176,22 +199,16 @@ class AdhocClient {
         return groupName || '__unnamed'
     }
 }
+
 // TODO: extract common data (connected clients, etc)
 //   for clustering/sharding
 class AdhocServer {
     #games = {}
     #connectedClients = []
-    constructor(addr = '0.0.0.0', options) {
-        this.addr = addr
-        const server = net.createServer(options)
-        server.on('listening', () => {
-            console.log(`listening on port ${server.address()?.port}`)
-        })
-        // relay connections to adhoc class
-        server.on('connection', this.handleConnection)
-        server.on('error', console.error)
+    #nextId = 0
+    constructor() {
     }
-    getGroupPeers(productcode, group) {
+    getGroup(productcode, group) {
         return this.#games[productcode]?.[group]
     }
     getGroups(productcode) {
@@ -199,6 +216,22 @@ class AdhocServer {
             return undefined
         }
         return Object.keys(this.#games[productcode])
+    }
+    addClient(client) {
+        if (!client.isDestroyed) {
+            this.#connectedClients.push(client)
+            console.log(`"${client.nickname}" (${client.macaddr}) started playing ${client.productcode}.`)
+            return true
+        }
+        return false
+    }
+    removeClient(client) {
+        const index = this.#connectedClients.findIndex(v => v.id === client.id)
+        if (index === -1) {
+            return true
+        }
+        const removed = this.#connectedClients.splice(index, 1)
+        return (removed.length > 0)
     }
     async addClientToGroup(client) {
         if (client.isDestroyed || !client.isLoggedIn || client.isConnected) {
@@ -239,6 +272,8 @@ class AdhocServer {
         if (!this.#games[client.productcode] || !this.#games[client.productcode][client.group]) {
             return true
         }
+
+        // announce client leave to peers
         const clientAnnouncement = Buffer.from(`${COMMON.CLIENT_OPCODES.DISCONNECT.toString().padStart(2, 0)}${stringToHex(client.nickname)}${client.macBytes.join('')}${ipToInt(client.ip).toString(16)}`, 'hex')
         for (const currPeer of this.#games[client.productcode][client.group].peers) {
             if (currPeer === client) {
@@ -250,60 +285,26 @@ class AdhocServer {
             await currPeer.socket.write(clientAnnouncement)
         }
 
-        const index = this.#games[client.productcode][client.group].peers.findIndex((v) => v === client)
-        this.#games[client.productcode][client.group].peers.splice(index, 1)
-        if (this.#games[client.productcode][client.group].peers.length === 0) {
+        // remove group
+        if (this.#games[client.productcode][client.group].peers.length === 1) {
+            // client is alone
             delete this.#games[client.productcode][client.group]
+        } else {
+            const index = this.#games[client.productcode][client.group].peers.findIndex((c) => c === client)
+            this.#games[client.productcode][client.group].peers.splice(index, 1)
         }
         console.log(`"${client.nickname}" (${client.macaddr}) has disconnected from ${client.productcode} group "${client.group}".`)
         return true
     }
     async handleConnection(conn) {
         // socket is managed by AdhocClient
-        const newClient = new AdhocClient(conn, this)
-
-        // wait for the client to login and connect to a group
-        let loginWait = 0
-        while (!newClient.isLoggedIn) {
-            if (loginWait > 100) { // 100 * 10ms
-                newClient.destroy('login timeout')
-                break
-            }
-            // wait for the peer to go through the login first
-            console.log(`Waiting for ${newClient.ip} to login...`)
-            loginWait++
-            await sleep(10)
-        }
-        if (!newClient.isLoggedIn || newClient.isDestroyed) {
-            return
-        }
-
-        // handle closing out here
-        // MAYBE: refactor into AdhocClient? how would group management work?
-        newClient.socket.on('close', (hadError) => {
-            // MAYBE: unref socket?
-            this.removeClientFromGroup(newClient)
-            const index = this.#connectedClients.findIndex(v => v === newClient)
-            this.#connectedClients.splice(index, 1)
-            console.log(`Closed connection to ${newClient.nickname}@${newClient.ip} (${newClient.macaddr})`)
-        })
-        // add client to list
-        this.#connectedClients.push(newClient)
-        console.log(`"${newClient.nickname}" (${newClient.macaddr}) started playing ${newClient.productcode}.`)
+        new AdhocClient(conn, this, this.#nextId++)
     }
     async destroy() {
         for (const client of this.#connectedClients) {
             await client.destroy('server shutdown')
         }
         return true
-    }
-    start() {
-        try {
-            server.listen(27312, this.addr)
-            return true
-        } catch(e) {
-            throw e
-        }
     }
 }
 
