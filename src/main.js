@@ -1,5 +1,7 @@
 const { COMMON, sleep, parseIP, ipToInt, stringToHex, BufferReader } = require('./util')
 // TODO: Ratelimiting/banning
+// TODO: reject clients that share MAC addr
+//   maybe reject same nick as well?
 // TODO: better logging (console.log is blocking)
 // TODO: make more robust (lots of parts just dont validate, such as client destroying)
 class AdhocClient {
